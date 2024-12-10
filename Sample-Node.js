@@ -1,4 +1,21 @@
 exports = async function(changeEvent) {
+  try {
+    // Log the full document from the change event
+    console.log("Trigger invoked!");
+    console.log("Full Document:", JSON.stringify(changeEvent.fullDocument, null, 2));
+
+    // Log additional metadata if needed
+    console.log("Namespace (Database and Collection):", changeEvent.ns);
+    console.log("Operation Type:", changeEvent.operationType);
+  } catch (error) {
+    console.error("An error occurred while running the test trigger:", error);
+  }
+};
+
+
+exports = async function(changeEvent) {
+
+  
   const db = context.services.get("mongodb-atlas").db("<your_database_name>");
   const stayCollection = db.collection("stay");
   const itemCollection = db.collection("item");

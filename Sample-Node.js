@@ -1,5 +1,58 @@
 exports = async function(changeEvent) {
   try {
+    const dbName = changeEvent.ns.db; // Dynamically get the database name
+    const db = context.services.get("mongodb-atlas").db(dbName);
+    const stayCollection = db.collection("stay");
+
+    // Log metadata
+    console.log("Trigger invoked!");
+    console.log("Namespace:", changeEvent.ns);
+    console.log("Operation Type:", changeEvent.operationType);
+
+    // Extract the full document
+    const fullDocument = changeEvent.fullDocument || {};
+    const player_id = fullDocument.player_id;
+    const itemStartDate = new Date(fullDocument.start_date);
+    const itemEndDate = new Date(fullDocument.end_date);
+
+    // Log extracted fields
+    console.log(`Player ID: ${player_id}`);
+    console.log(`Item Start Date: ${itemStartDate}`);
+    console.log(`Item End Date: ${itemEndDate}`);
+
+    // Validate essential fields
+    if (!player_id || !itemStartDate || !itemEndDate) {
+      console.log("Essential fields missing from the document. Skipping processing.");
+      return;
+    }
+
+    // Search for a matching stay record
+    console.log("Searching for matching records in the 'stay' collection...");
+    const matchingStay = await stayCollection.findOne({
+      player_id,
+      $or: [
+        { $and: [{ start_date: { $lte: itemStartDate } }, { end_date: { $gte: itemStartDate } }] },
+        { $and: [{ start_date: { $lte: itemEndDate } }, { end_date: { $gte: itemEndDate } }] }
+      ]
+    });
+
+    // Log the result of the search
+    if (matchingStay) {
+      console.log("Matching stay record found:");
+      console.log(JSON.stringify(matchingStay, null, 2));
+    } else {
+      console.log("No matching stay record found.");
+    }
+  } catch (error) {
+    console.error("An error occurred while running the trigger:", error);
+  }
+};
+
+-----------------------
+
+
+exports = async function(changeEvent) {
+  try {
     // Get the full document from the change event
     const item = changeEvent.fullDocument;
 

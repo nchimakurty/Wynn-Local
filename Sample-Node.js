@@ -1,4 +1,34 @@
 exports = async function(changeEvent) {
+  try {
+    // Get the full document from the change event
+    const item = changeEvent.fullDocument;
+
+    if (item) {
+      // Extract the required fields
+      const player_id = item.player_id;
+      const roomStartDate = item.room?.start_date;
+      const roomEndDate = item.room?.end_date;
+
+      // Log the extracted fields
+      console.log("Trigger invoked!");
+      console.log(`Player ID: ${player_id}`);
+      console.log(`Room Start Date: ${roomStartDate}`);
+      console.log(`Room End Date: ${roomEndDate}`);
+    } else {
+      console.log("No full document available in the change event.");
+    }
+
+    // Log additional metadata if needed
+    console.log("Namespace (Database and Collection):", changeEvent.ns);
+    console.log("Operation Type:", changeEvent.operationType);
+  } catch (error) {
+    console.error("An error occurred while running the test trigger:", error);
+  }
+};
+
+
+
+exports = async function(changeEvent) {
   // Dynamically get the database name from the change event
   const dbName = changeEvent.ns.db;
   const db = context.services.get("mongodb-atlas").db(dbName);

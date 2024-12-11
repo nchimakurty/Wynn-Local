@@ -1,5 +1,78 @@
 exports = async function(changeEvent) {
   try {
+    const dbName = changeEvent.ns.db; // Dynamically get the database name
+    const db = context.services.get("mongodb-atlas").db(dbName);
+    const stayCollection = db.collection("stay");
+
+    console.log("Trigger invoked!");
+
+    // Extract fields from the fullDocument
+    const fullDocument = changeEvent.fullDocument || {};
+    const player_id = fullDocument.player_id;
+    const itemStartDate = new Date(fullDocument.start_date);
+    const itemEndDate = new Date(fullDocument.end_date);
+
+    // Validate fields
+    if (!player_id || isNaN(itemStartDate.getTime()) || isNaN(itemEndDate.getTime())) {
+      console.log("Essential fields are invalid or missing. Skipping processing.");
+      return;
+    }
+
+    console.log(`Player ID: ${player_id}`);
+    console.log(`Item Start Date: ${itemStartDate}`);
+    console.log(`Item End Date: ${itemEndDate}`);
+
+    // Search for a matching stay record
+    const matchingStay = await stayCollection.findOne({
+      player_id,
+      $or: [
+        { $and: [{ start_date: { $lte: itemStartDate } }, { end_date: { $gte: itemStartDate } }] },
+        { $and: [{ start_date: { $lte: itemEndDate } }, { end_date: { $gte: itemEndDate } }] }
+      ]
+    });
+
+    if (!matchingStay) {
+      // No matching record found; insert a new record
+      const newStay = {
+        player_id,
+        start_date: itemStartDate,
+        end_date: itemEndDate
+      };
+      const insertResult = await stayCollection.insertOne(newStay);
+      console.log("No matching stay record found. Inserted new record:", newStay);
+    } else {
+      // Matching record found; update it if necessary
+      console.log("Matching stay record before update:", JSON.stringify(matchingStay, null, 2));
+
+      const updates = {};
+      if (itemStartDate < new Date(matchingStay.start_date)) {
+        updates.start_date = itemStartDate;
+      }
+      if (itemEndDate > new Date(matchingStay.end_date)) {
+        updates.end_date = itemEndDate;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        const updateResult = await stayCollection.updateOne(
+          { _id: matchingStay._id },
+          { $set: updates }
+        );
+        const updatedStay = await stayCollection.findOne({ _id: matchingStay._id });
+        console.log("Matching stay record after update:", JSON.stringify(updatedStay, null, 2));
+      } else {
+        console.log("No updates required for the matching stay record.");
+      }
+    }
+  } catch (error) {
+    console.error("An error occurred while running the trigger:", error.message);
+    console.error("Error Stack Trace:", error.stack);
+  }
+};
+
+-------------------------------
+
+exports = async function(changeEvent) {
+  try {
     console.log("Trigger invoked!");
 
     // Get all services

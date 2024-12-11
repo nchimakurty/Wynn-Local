@@ -1,5 +1,25 @@
 exports = async function(changeEvent) {
   try {
+    console.log("Trigger invoked!");
+
+    // Get all services
+    const services = context.services;
+
+    // Iterate over and log all service names
+    console.log("Available Service Names:");
+    Object.keys(services).forEach(serviceName => {
+      console.log(`- ${serviceName}`);
+    });
+
+  } catch (error) {
+    console.error("An error occurred while retrieving service names:", error);
+  }
+};
+
+--------------------------
+
+exports = async function(changeEvent) {
+  try {
     const dbName = changeEvent.ns.db; // Dynamically get the database name
     const db = context.services.get("mongodb-atlas").db(dbName);
     const stayCollection = db.collection("stay");

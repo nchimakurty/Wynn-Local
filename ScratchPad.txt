@@ -1,6 +1,1 @@
 1. player_id, start_date and end_date are passed for a record to be merged (insert or update) into collection "item"
-2. A search need to happen against collection "stay" 
-    if there is any record for matching player_id wih value item.start_date falls between stay.start_date and stay.end_date or item.end_date falls between stay.start_date and stay.end_date
-        then update stay.start_date as item.start_date if stay.start_date > item.start_date
-             update stay.end_date as item.end_date if stay.end_date < item.end_date
-3. Update the field "stay_id" field in collection "item" with this stay._id

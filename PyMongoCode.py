@@ -204,24 +204,24 @@ import pymongo
 import json
 import datetime
 
-def upsert_reservations_to_mongo(df: DataFrame, 
-                                 database_name: str, 
-                                 collection_name: str, 
-                                 mongo_connection_string: str,
-                                 error_collection_name: str = None):
+def upsert_reservations_to_mongo_with_types(df, database_name, collection_name, mongo_connection_string, error_collection_name=None):
     """
-    Upserts reservation records from Spark DataFrame into MongoDB collection.
-    Logs errors in a separate collection if specified.
+    Upserts each row from the DataFrame into MongoDB, converting fields to match legacy data types.
     """
+    import pymongo
+    import json
+
     client = pymongo.MongoClient(mongo_connection_string)
     db = client[database_name]
     collection = db[collection_name]
     errors = []
 
+    # Convert Spark DataFrame to dict records
     data = df.toPandas().to_dict(orient='records')
+
     for row in data:
         try:
-            # Parse/clean special_requests field as list (if it's JSON)
+            # Handle special_requests as list
             special_requests = row.get('SPECIAL_REQUESTS', [])
             if isinstance(special_requests, str):
                 try:
@@ -231,7 +231,19 @@ def upsert_reservations_to_mongo(df: DataFrame,
                 except Exception:
                     special_requests = []
 
-            # Build filter and update documents
+            # Data type conversions as in the original code
+            def to_int(val):
+                try:
+                    return int(val)
+                except:
+                    return None
+            def to_float(val):
+                try:
+                    return float(val)
+                except:
+                    return None
+
+            # Filter: Prefer CONFIRMATION_ID if present
             if row['CONFIRMATION_ID'] is not None:
                 filter_doc = {
                     "player_id": row['PLAYER_ID'],
@@ -242,14 +254,15 @@ def upsert_reservations_to_mongo(df: DataFrame,
                     "player_id": row['PLAYER_ID'],
                     "room.reservation_id": row['RESERVATION_ID']
                 }
-
+            
+            # Build the update document, with conversions
             update_doc = {
                 "$set": {
-                    "start_date": row['START_DATE'],
+                    "start_date": row['START_DATE'],   # Already ISO string, can convert if needed
                     "end_date": row['END_DATE'],
                     "created_dtm": row['CREATED_DTM'],
                     "last_update_dtm": row['LAST_UPDATE_DTM'],
-                    "site_id": int(row['SITE_ID']) if row['SITE_ID'] is not None else None,
+                    "site_id": to_int(row['SITE_ID']),
                     "status": row['STATUS'],
                     "last_name": row['LAST_NAME'],
                     "first_name": row['FIRST_NAME'],
@@ -263,14 +276,14 @@ def upsert_reservations_to_mongo(df: DataFrame,
                         "room_type": row['ROOM_TYPE'],
                         "precheckin": row['PRECHECKIN'],
                         "special_requests": special_requests,
-                        "occupants": int(row['OCCUPANTS']) if row['OCCUPANTS'] is not None else None,
-                        "adults": int(row['ADULTS']) if row['ADULTS'] is not None else None,
-                        "children": int(row['CHILDREN']) if row['CHILDREN'] is not None else None,
+                        "occupants": to_int(row['OCCUPANTS']),
+                        "adults": to_int(row['ADULTS']),
+                        "children": to_int(row['CHILDREN']),
                         "market_code_first_day": row['MARKET_CODE_FIRST_DAY'],
                         "rate_code_first_day": row['RATE_CODE_FIRST_DAY'],
                         "block_code_first_day": row['BLOCK_CODE_FIRST_DAY'],
-                        "deposit_amount": float(row['DEPOSIT_AMOUNT']) if row['DEPOSIT_AMOUNT'] else 0.0,
-                        "deposit_due_amount": float(row['DEPOSIT_DUE_AMOUNT']) if row['DEPOSIT_DUE_AMOUNT'] else 0.0,
+                        "deposit_amount": to_float(row['DEPOSIT_AMOUNT']),
+                        "deposit_due_amount": to_float(row['DEPOSIT_DUE_AMOUNT']),
                         "guarantee_due": row['GUARANTEE_DUE'],
                         "company_booking": row['COMPANY_BOOKING'],
                         "routing_room": row['ROUTING_ROOM'],
@@ -278,12 +291,9 @@ def upsert_reservations_to_mongo(df: DataFrame,
                     }
                 }
             }
-
-            # Remove None values (optional, makes Mongo insert cleaner)
-            update_doc = json.loads(json.dumps(update_doc, default=str), object_hook=lambda d: {k: v for k, v in d.items() if v is not None})
-
-            # Upsert document in MongoDB
-            result = collection.update_one(filter_doc, update_doc, upsert=True)
+            # Upsert into MongoDB
+            collection.update_one(filter_doc, update_doc, upsert=True)
+        
         except Exception as e:
             error_detail = {
                 "RESERVATION_ID": row.get('RESERVATION_ID', ''),
@@ -292,11 +302,12 @@ def upsert_reservations_to_mongo(df: DataFrame,
             }
             errors.append(error_detail)
 
-    # Optionally log errors to MongoDB collection
+    # Optionally log errors
     if error_collection_name and errors:
         db[error_collection_name].insert_many(errors)
 
     return {"total_processed": len(data), "errors": errors}
+
 
 
 

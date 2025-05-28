@@ -196,3 +196,117 @@ df = SFModule.get_spark_df_from_sf(sqlQuery=sql_query)
 # COMMAND ----------
 
 display(df)
+
+
+
+from pyspark.sql import DataFrame
+import pymongo
+import json
+import datetime
+
+def upsert_reservations_to_mongo(df: DataFrame, 
+                                 database_name: str, 
+                                 collection_name: str, 
+                                 mongo_connection_string: str,
+                                 error_collection_name: str = None):
+    """
+    Upserts reservation records from Spark DataFrame into MongoDB collection.
+    Logs errors in a separate collection if specified.
+    """
+    client = pymongo.MongoClient(mongo_connection_string)
+    db = client[database_name]
+    collection = db[collection_name]
+    errors = []
+
+    data = df.toPandas().to_dict(orient='records')
+    for row in data:
+        try:
+            # Parse/clean special_requests field as list (if it's JSON)
+            special_requests = row.get('SPECIAL_REQUESTS', [])
+            if isinstance(special_requests, str):
+                try:
+                    special_requests = json.loads(special_requests)
+                    if not isinstance(special_requests, list):
+                        special_requests = []
+                except Exception:
+                    special_requests = []
+
+            # Build filter and update documents
+            if row['CONFIRMATION_ID'] is not None:
+                filter_doc = {
+                    "player_id": row['PLAYER_ID'],
+                    "confirmation_id": row['CONFIRMATION_ID']
+                }
+            else:
+                filter_doc = {
+                    "player_id": row['PLAYER_ID'],
+                    "room.reservation_id": row['RESERVATION_ID']
+                }
+
+            update_doc = {
+                "$set": {
+                    "start_date": row['START_DATE'],
+                    "end_date": row['END_DATE'],
+                    "created_dtm": row['CREATED_DTM'],
+                    "last_update_dtm": row['LAST_UPDATE_DTM'],
+                    "site_id": int(row['SITE_ID']) if row['SITE_ID'] is not None else None,
+                    "status": row['STATUS'],
+                    "last_name": row['LAST_NAME'],
+                    "first_name": row['FIRST_NAME'],
+                    "email": row['EMAIL'],
+                    "phone_number": row['PHONE_NUMBER'],
+                    "confirmation_id": row['CONFIRMATION_ID'],
+                    "room": {
+                        "reservation_id": row['RESERVATION_ID'],
+                        "source_system_code": row['SOURCE_SYSTEM_CODE'],
+                        "source_system_id": row['SOURCE_SYSTEM_ID'],
+                        "room_type": row['ROOM_TYPE'],
+                        "precheckin": row['PRECHECKIN'],
+                        "special_requests": special_requests,
+                        "occupants": int(row['OCCUPANTS']) if row['OCCUPANTS'] is not None else None,
+                        "adults": int(row['ADULTS']) if row['ADULTS'] is not None else None,
+                        "children": int(row['CHILDREN']) if row['CHILDREN'] is not None else None,
+                        "market_code_first_day": row['MARKET_CODE_FIRST_DAY'],
+                        "rate_code_first_day": row['RATE_CODE_FIRST_DAY'],
+                        "block_code_first_day": row['BLOCK_CODE_FIRST_DAY'],
+                        "deposit_amount": float(row['DEPOSIT_AMOUNT']) if row['DEPOSIT_AMOUNT'] else 0.0,
+                        "deposit_due_amount": float(row['DEPOSIT_DUE_AMOUNT']) if row['DEPOSIT_DUE_AMOUNT'] else 0.0,
+                        "guarantee_due": row['GUARANTEE_DUE'],
+                        "company_booking": row['COMPANY_BOOKING'],
+                        "routing_room": row['ROUTING_ROOM'],
+                        "share_with_parent_id": row['SHARE_WITH_PARENT_ID']
+                    }
+                }
+            }
+
+            # Remove None values (optional, makes Mongo insert cleaner)
+            update_doc = json.loads(json.dumps(update_doc, default=str), object_hook=lambda d: {k: v for k, v in d.items() if v is not None})
+
+            # Upsert document in MongoDB
+            result = collection.update_one(filter_doc, update_doc, upsert=True)
+        except Exception as e:
+            error_detail = {
+                "RESERVATION_ID": row.get('RESERVATION_ID', ''),
+                "ERROR_MSG": str(e),
+                "ROW": row
+            }
+            errors.append(error_detail)
+
+    # Optionally log errors to MongoDB collection
+    if error_collection_name and errors:
+        db[error_collection_name].insert_many(errors)
+
+    return {"total_processed": len(data), "errors": errors}
+
+
+
+result = upsert_reservations_to_mongo(
+    df=df,
+    database_name=database_name,
+    collection_name="YourTargetCollection",   # Set this!
+    mongo_connection_string=mongo_connection_string,
+    error_collection_name="UpsertErrors"      # Optional: saves error rows in a MongoDB collection
+)
+
+print("Done! Processed:", result["total_processed"], "Errors:", len(result["errors"]))
+

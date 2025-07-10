@@ -6,6 +6,7 @@ import requests
 import json
 import io
 
+
 def main(session: snowpark.Session):
 
     api_config = _snowflake.get_generic_secret_string('API_CONFIG')

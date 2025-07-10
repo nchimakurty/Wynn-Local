@@ -1,40 +1,40 @@
 db.collection.aggregate([
+  // Stage 1: Ensure both fields exist
   {
-    $addFields: {
-      venue_key: {
-        $cond: [
+    $match: {
+      $and: [
+        { venue_id: { $exists: true } },
+        { venue_key: { $exists: true } }
+      ]
+    }
+  },
+
+  // Stage 2: Filter documents where venue_id == venue_key and neither is null or empty
+  {
+    $match: {
+      $expr: {
+        $and: [
           { $eq: ["$venue_id", "$venue_key"] },
-          "123",
-          "$venue_key"
+          { $ne: ["$venue_id", ""] },
+          { $ne: ["$venue_key", ""] },
+          { $ne: ["$venue_id", null] },
+          { $ne: ["$venue_key", null] }
         ]
       }
     }
   },
-  {
-    $merge: {
-      into: "collection",
-      whenMatched: "merge",
-      whenNotMatched: "discard"
-    }
-  }
-]);
 
-
-db.collection.aggregate([
+  // Stage 3: Update venue_key to "123"
   {
-    $addFields: {
-      venue_key: {
-        $cond: [
-          { $eq: ["$venue_key", ""] },
-          "xyz",
-          "$venue_key"
-        ]
-      }
+    $set: {
+      venue_key: "123"
     }
   },
+
+  // Stage 4: Write updated docs back into the collection
   {
     $merge: {
-      into: "collection",
+      into: "collection", // Change this to your actual collection name
       whenMatched: "merge",
       whenNotMatched: "discard"
     }

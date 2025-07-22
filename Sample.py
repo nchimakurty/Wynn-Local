@@ -88,3 +88,34 @@ WHEN MATCHED THEN UPDATE SET
 
 
 {'code': 400, 'status': 400, 'msg': 'No shift found for date and time', 'request_id': '1753219088.688000ff1000ff00ff36906a1649a60001737e736576656e726f6f6d732d7365637572652d64656d6f00016170692d6578743a636972636c6563692d3063386133346265313900010156'}
+
+
+
+import requests
+
+try:
+    response = requests.post(url, headers=headers, json=params)
+    
+    # Parse JSON response
+    result = response.json()
+
+    if response.status_code == 200:
+        # Handle successful response (custom format)
+        print("✅ Success:")
+        print(json.dumps(result, indent=4))
+    
+    else:
+        # Known error response format
+        print("⚠️ API responded with an error:")
+        print(f"Status Code: {response.status_code}")
+        print(f"Message: {result.get('msg', 'No message provided')}")
+        print(f"Request ID: {result.get('request_id')}")
+        
+        # Do NOT raise exception — you are handling it gracefully
+        # Optionally log or store result
+
+except requests.exceptions.RequestException as e:
+    # Catch hard failures only (e.g., timeout, DNS failure)
+    print("❌ Hard failure occurred:")
+    print(str(e))
+    raise  # Re-raise if you want the notebook/job to fail

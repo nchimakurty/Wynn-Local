@@ -1,8 +1,15 @@
-# Collect Snowpark rows to local memory
-rows = df.collect()
+import requests
 
-# Loop through each row and send as API request
-for idx, row in enumerate(rows):
+api_results = []  # To store results for writing back
+
+venue_id = "ahhzfnNldmVucm9vbXMtc2VjdXJlLWRlbW9yHAsSD25pZ2h0bG9vcF9WZW51ZRiAgOixg9myCww"
+url = f"https://demo.sevenrooms.com/api-ext/2_4/venues/{venue_id}/book"
+headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Authorization": "4942ada5c40cfc408ddb73a394af2cd8a351691f29ee4e9f27383bdc56d1051594fd77395415511a25f8fede5b451ea7d6d9a970e68ab04ccba8c41a77425cf5"
+}
+
+for row in rows:
     payload = {
         "date": str(row['DATE']),
         "time": row['TIME'],
@@ -33,7 +40,48 @@ for idx, row in enumerate(rows):
     try:
         response = requests.put(url, data=payload, headers=headers)
         response.raise_for_status()
-        print(f"✅ Success [{idx}]:", response.json())
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error [{idx}]: {e}")
-        print("Response:", response.text)
+        result = response.json()
+        
+        api_results.append({
+            "reservation_id": row['RESERVATION_ID'],
+            "confirmation_code": result.get("confirmation_code", ""),
+            "status": result.get("status", ""),
+            "table_id": result.get("table_id", ""),
+            "reservation_url": result.get("reservation_url", "")
+        })
+        
+    except Exception as e:
+        print(f"❌ Error for reservation {row['RESERVATION_ID']}: {e}")
+
+
+
+
+
+
+
+
+from snowflake.snowpark import Row
+
+# Convert list of dicts to Snowpark DataFrame
+response_rows = [Row(**r) for r in api_results]
+response_df = session.create_dataframe(response_rows)
+
+
+
+
+
+
+response_df.write.mode("overwrite").save_as_table("BOOKING_API_RESULTS")
+
+
+
+session.sql("""
+MERGE INTO BOOKINGS_TABLE tgt
+USING BOOKING_API_RESULTS src
+ON tgt.reservation_id = src.reservation_id
+WHEN MATCHED THEN UPDATE SET
+    tgt.confirmation_code = src.confirmation_code,
+    tgt.status = src.status,
+    tgt.table_id = src.table_id,
+    tgt.reservation_url = src.reservation_url
+""").collect()

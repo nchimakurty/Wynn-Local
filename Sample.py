@@ -85,3 +85,6 @@ WHEN MATCHED THEN UPDATE SET
     tgt.table_id = src.table_id,
     tgt.reservation_url = src.reservation_url
 """).collect()
+
+
+{'code': 400, 'status': 400, 'msg': 'No shift found for date and time', 'request_id': '1753219088.688000ff1000ff00ff36906a1649a60001737e736576656e726f6f6d732d7365637572652d64656d6f00016170692d6578743a636972636c6563692d3063386133346265313900010156'}

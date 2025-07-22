@@ -1,121 +1,43 @@
-import requests
-
 api_results = []  # To store results for writing back
 
-venue_id = "ahhzfnNldmVucm9vbXMtc2VjdXJlLWRlbW9yHAsSD25pZ2h0bG9vcF9WZW51ZRiAgOixg9myCww"
-url = f"https://demo.sevenrooms.com/api-ext/2_4/venues/{venue_id}/book"
-headers = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Authorization": "4942ada5c40cfc408ddb73a394af2cd8a351691f29ee4e9f27383bdc56d1051594fd77395415511a25f8fede5b451ea7d6d9a970e68ab04ccba8c41a77425cf5"
-}
+# Collect Snowpark rows to local memory
+rowsEligibileHotelReservations = dfEligibileHotelReservations.collect()
 
-for row in rows:
+# Loop through each row and send as API request
+for idx, row in enumerate(rowsEligibileHotelReservations):
     payload = {
-        "date": str(row['DATE']),
-        "time": row['TIME'],
-        "party_size": str(row['PARTY_SIZE']),
-        "first_name": row['FIRST_NAME'],
-        "last_name": row['LAST_NAME'],
-        "phone": row['PHONE'],
-        "reservation_id": row['RESERVATION_ID'],
+        "date": row['BKFRESERVATIONDATE'],
+        "time": row['BKFRESERVATIONTIME'],
+        "party_size": row['BKFPARTYSIZE'],
+        "first_name": row['FIRSTNAME'],
+        "last_name": row['LASTNAME'],
+        "phone": row['PHONENUMBER'],
         "email": row['EMAIL'],
-        "external_id": row['EXTERNAL_ID'],
-        "external_user_id": row['EXTERNAL_USER_ID'],
-        "send_client_email": "true",
-        "send_client_sms": "false",
-        "reservation_sms_opt_in": "true",
-        "send_reminder_email": "true",
-        "send_reminder_sms": "true",
-        "venue_group_marketing_opt_in": "true",
-        "venue_marketing_opt_in": "true",
-        "is_walkin": "false",
-        "duration": "60",
-        "mf_ratio_male": "1",
-        "mf_ratio_female": "1",
-        "double_bookings_only_client_id_check": "true",
-        "payment_by_paylink": "false",
-        "paylink_cancel_time": "0"
+        "notes": row['BKFNOTES']
     }
 
     try:
         response = requests.put(url, data=payload, headers=headers)
-        response.raise_for_status()
+        # response.raise_for_status()
         result = response.json()
+
+        if response.status_code == 200:
+          # Handle successful response
+          api_results.append({
+              "reservation_id": result.get("reservation_id", ""),
+              "reservation_reference_code": result.get("reservation_reference_code", ""),
+              "client_id": result.get("client_id", ""),
+              "client_reference_code": result.get("client_reference_code", "")
+          })      
+        else:
+          # Error handling
+          api_results.append({
+              "msg": result.get("msg", ""),
+              "request_id": result.get("request_id", "")
+          })            
+          
+    except requests.exceptions.RequestException as e:
+        # Catch hard failures only (e.g., timeout, DNS failure)
+        print(str(e))        
         
-        api_results.append({
-            "reservation_id": row['RESERVATION_ID'],
-            "confirmation_code": result.get("confirmation_code", ""),
-            "status": result.get("status", ""),
-            "table_id": result.get("table_id", ""),
-            "reservation_url": result.get("reservation_url", "")
-        })
-        
-    except Exception as e:
-        print(f"❌ Error for reservation {row['RESERVATION_ID']}: {e}")
-
-
-
-
-
-
-
-
-from snowflake.snowpark import Row
-
-# Convert list of dicts to Snowpark DataFrame
-response_rows = [Row(**r) for r in api_results]
-response_df = session.create_dataframe(response_rows)
-
-
-
-
-
-
-response_df.write.mode("overwrite").save_as_table("BOOKING_API_RESULTS")
-
-
-
-session.sql("""
-MERGE INTO BOOKINGS_TABLE tgt
-USING BOOKING_API_RESULTS src
-ON tgt.reservation_id = src.reservation_id
-WHEN MATCHED THEN UPDATE SET
-    tgt.confirmation_code = src.confirmation_code,
-    tgt.status = src.status,
-    tgt.table_id = src.table_id,
-    tgt.reservation_url = src.reservation_url
-""").collect()
-
-
-{'code': 400, 'status': 400, 'msg': 'No shift found for date and time', 'request_id': '1753219088.688000ff1000ff00ff36906a1649a60001737e736576656e726f6f6d732d7365637572652d64656d6f00016170692d6578743a636972636c6563692d3063386133346265313900010156'}
-
-
-
-import requests
-
-try:
-    response = requests.post(url, headers=headers, json=params)
-    
-    # Parse JSON response
-    result = response.json()
-
-    if response.status_code == 200:
-        # Handle successful response (custom format)
-        print("✅ Success:")
-        print(json.dumps(result, indent=4))
-    
-    else:
-        # Known error response format
-        print("⚠️ API responded with an error:")
-        print(f"Status Code: {response.status_code}")
-        print(f"Message: {result.get('msg', 'No message provided')}")
-        print(f"Request ID: {result.get('request_id')}")
-        
-        # Do NOT raise exception — you are handling it gracefully
-        # Optionally log or store result
-
-except requests.exceptions.RequestException as e:
-    # Catch hard failures only (e.g., timeout, DNS failure)
-    print("❌ Hard failure occurred:")
-    print(str(e))
-    raise  # Re-raise if you want the notebook/job to fail
+print(api_results)

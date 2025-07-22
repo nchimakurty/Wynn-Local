@@ -18,26 +18,35 @@ for idx, row in enumerate(rowsEligibileHotelReservations):
 
     try:
         response = requests.put(url, data=payload, headers=headers)
-        # response.raise_for_status()
         result = response.json()
 
-        if response.status_code == 200:
-          # Handle successful response
-          api_results.append({
-              "reservation_id": result.get("reservation_id", ""),
-              "reservation_reference_code": result.get("reservation_reference_code", ""),
-              "client_id": result.get("client_id", ""),
-              "client_reference_code": result.get("client_reference_code", "")
-          })      
-        else:
-          # Error handling
-          api_results.append({
-              "msg": result.get("msg", ""),
-              "request_id": result.get("request_id", "")
-          })            
-          
+        # Prepare uniform result structure
+        record = {
+            "GRIDNUM": row['GRIDNUM'],
+            "PLAYERID": row['PLAYERID'],
+            "reservation_id": result.get("reservation_id", ""),
+            "reservation_reference_code": result.get("reservation_reference_code", ""),
+            "client_id": result.get("client_id", ""),
+            "client_reference_code": result.get("client_reference_code", ""),
+            "msg": result.get("msg", ""),
+            "request_id": result.get("request_id", ""),
+            "status_code": response.status_code
+        }
+
+        api_results.append(record)
+
     except requests.exceptions.RequestException as e:
-        # Catch hard failures only (e.g., timeout, DNS failure)
-        print(str(e))        
-        
+        # Handle hard errors like timeouts
+        api_results.append({
+            "GRIDNUM": row['GRIDNUM'],
+            "PLAYERID": row['PLAYERID'],
+            "reservation_id": "",
+            "reservation_reference_code": "",
+            "client_id": "",
+            "client_reference_code": "",
+            "msg": str(e),
+            "request_id": "",
+            "status_code": "RequestException"
+        })
+
 print(api_results)

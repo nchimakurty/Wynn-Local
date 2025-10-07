@@ -1,49 +1,99 @@
-// Aggregation Pipeline to update venue_key to "123" where venue_id and venue_key match
+Test a single key end-to-end (Aggregation Builder)
 
 [
-    // Stage 1: Ensure both fields exist
-    {
-      $match: {
-        $and: [
-          { venue_id: { $exists: true } },
-          { venue_key: { $exists: true } }
-        ]
-      }
-    },
-  
-    // Stage 2: Filter documents where venue_id == venue_key and neither is null or empty
-    {
-      $match: {
-        $expr: {
-          $and: [
-            { $eq: ["$venue_id", "$venue_key"] },
-            { $ne: ["$venue_id", ""] },
-            { $ne: ["$venue_key", ""] },
-            { $ne: ["$venue_id", null] },
-            { $ne: ["$venue_key", null] }
-          ]
+  // Stage 1: limit to ONE key so you can test safely
+  {
+    $match: {
+      venue_id: { $exists: true, $ne: null, $ne: "" },
+      venue_key: { $exists: true, $ne: null, $ne: "", $eq: "ksdflkjsd" } // <-- change this to the key you want to test
+    }
+  },
+
+  // Stage 2: only where venue_id == venue_key
+  {
+    $match: { $expr: { $eq: ["$venue_id", "$venue_key"] } }
+  },
+
+  // Stage 3: apply mapping (switch keeps everything else unchanged)
+  {
+    $set: {
+      venue_key: {
+        $switch: {
+          branches: [
+            { case: { $eq: ["$venue_key", "ksdflkjsd"] }, then: "id79854" },
+            { case: { $eq: ["$venue_key", "yiruytv,mnf"] }, then: "id09320492" } // duplicate resolved to this
+          ],
+          default: "$venue_key"
         }
       }
-    },
-  
-    // Get count
-    {
-      $count: "matchingDocumentsCount"
-    },
+    }
+  },
 
-    // Stage 3: Update venue_key to "123"
-    {
-      $set: {
-        venue_key: "123"
-      }
-    },
-  
-    // Stage 4: Write updated docs back into the collection
-    {
-      $merge: {
-        into: "IB_Ops_DiningReservations", 
-        whenMatched: "merge",
-        whenNotMatched: "discard"
+  // Stage 4: write back
+  {
+    $merge: {
+      into: "IB_Ops_DiningReservations",
+      on: "_id",
+      whenMatched: "merge",
+      whenNotMatched: "discard"
+    }
+  }
+]
+
+
+
+Optional: preview count before writing (no update)
+
+If you want to just see how many docs would match your single key + equality rule, run this minimal pipeline:
+
+
+[
+  { $match: {
+      venue_id: { $exists: true, $ne: null, $ne: "" },
+      venue_key: { $exists: true, $ne: null, $ne: "", $eq: "ksdflkjsd" } // same test key
+    }
+  },
+  { $match: { $expr: { $eq: ["$venue_id", "$venue_key"] } } },
+  { $count: "toUpdate" }
+]
+
+
+
+When you’re ready to run for all keys
+
+Remove the single-key filter and update everything in one go:
+
+
+[
+  {
+    $match: {
+      venue_id: { $exists: true, $ne: null, $ne: "" },
+      venue_key: { $exists: true, $ne: null, $ne: "" }
+    }
+  },
+  { $match: { $expr: { $eq: ["$venue_id", "$venue_key"] } } },
+  {
+    $set: {
+      venue_key: {
+        $switch: {
+          branches: [
+            { case: { $eq: ["$venue_key", "ksdflkjsd"] }, then: "id79854" },
+            { case: { $eq: ["$venue_key", "yiruytv,mnf"] }, then: "id09320492" }
+          ],
+          default: "$venue_key"
+        }
       }
     }
-  ]
+  },
+  {
+    $merge: {
+      into: "IB_Ops_DiningReservations",
+      on: "_id",
+      whenMatched: "merge",
+      whenNotMatched: "discard"
+    }
+  }
+]
+
+
+

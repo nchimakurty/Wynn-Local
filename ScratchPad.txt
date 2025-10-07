@@ -1,1 +1,49 @@
-1. player_id, start_date and end_date are passed for a record to be merged (insert or update) into collection "item"
+// Aggregation Pipeline to update venue_key to "123" where venue_id and venue_key match
+
+[
+    // Stage 1: Ensure both fields exist
+    {
+      $match: {
+        $and: [
+          { venue_id: { $exists: true } },
+          { venue_key: { $exists: true } }
+        ]
+      }
+    },
+  
+    // Stage 2: Filter documents where venue_id == venue_key and neither is null or empty
+    {
+      $match: {
+        $expr: {
+          $and: [
+            { $eq: ["$venue_id", "$venue_key"] },
+            { $ne: ["$venue_id", ""] },
+            { $ne: ["$venue_key", ""] },
+            { $ne: ["$venue_id", null] },
+            { $ne: ["$venue_key", null] }
+          ]
+        }
+      }
+    },
+  
+    // Get count
+    {
+      $count: "matchingDocumentsCount"
+    },
+
+    // Stage 3: Update venue_key to "123"
+    {
+      $set: {
+        venue_key: "123"
+      }
+    },
+  
+    // Stage 4: Write updated docs back into the collection
+    {
+      $merge: {
+        into: "IB_Ops_DiningReservations", 
+        whenMatched: "merge",
+        whenNotMatched: "discard"
+      }
+    }
+  ]

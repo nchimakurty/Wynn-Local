@@ -1,3 +1,58 @@
+# <<< NEW: short-circuit decision based on audit/status SQL
+def bkfbuffetreservation_run_guard(**kwargs):
+    """
+    Return False if dag_bkfbuffetreservation_load has already completed today
+    (according to the status SQL); True otherwise.
+
+    This is analogous to cipedw_operawlv_hotelguestdailyagg_load_report_to_html_email,
+    but instead of sending an email, we just decide whether to continue the DAG.
+    """
+    # Point this to a SQL file that checks your audit/status table
+    # and returns at least one row if today's run is already completed.
+    sql_file_path = '/usr/local/airflow/include/sql/snowflake/bkf/bkfbuffetreservation_load_status_check.sql'
+
+    with open(sql_file_path, 'r') as file:
+        query = file.read()
+
+    # Use the same audit connection you used in the WLV check
+    hook = BaseHook.get_hook('CIP_EDW_AUDIT_SQLDB_CONN')
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    if rows:
+        # At least one record means this DAG has already completed today
+        print("dag_bkfbuffetreservation_load has already completed today. Short-circuiting downstream tasks.")
+        return False   # ShortCircuitOperator will SKIP all downstream tasks
+    else:
+        print("dag_bkfbuffetreservation_load has NOT completed today. Proceeding with execution.")
+        return True    # ShortCircuitOperator will allow downstream tasks to run
+# >>> NEW
+
+
+
+from airflow.operators.python import ShortCircuitOperator  # <<< ensure import
+
+# <<< NEW: short-circuit task using the guard function above
+bkfbuffetreservation_load_run_guard = ShortCircuitOperator(
+    task_id='bkfbuffetreservation_load_run_guard',
+    python_callable=bkfbuffetreservation_run_guard,
+)
+# >>> NEW
+
+# <<< UPDATED: prepend the guard to the existing chain
+bkfbuffetreservation_load_run_guard >> fetch_abc_metadata >> get_abc_curr_job_run_details >> get_abc_curr_job_run_details_databricks >> cipedw_operawlv_hotelguestdailyagg_load_report >> check_dag_cipedw_operawlv_hotelguestdailyagg_load_sensor >> begin_audit_job_execution >> bkfbuffetreservation_data_load >> on_ingestion_success >> bkf_reservervations_stats_report >> end_audit_job_execution >> mark_job_ready_for_nextrun
+# >>> UPDATED
+
+
+-----------------------------------------------------------------------------
+
+
 from __future__ import annotations
 
 import os

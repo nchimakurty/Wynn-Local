@@ -1,336 +1,299 @@
+from __future__ import annotations
 
-# Databricks notebook source
-# MAGIC %md
-# MAGIC ## Library setup
+import os
+import json, logging
+import pendulum
+from datetime import datetime, timedelta
+from airflow import DAG, Dataset
+from airflow.decorators import task
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.providers.microsoft.mssql.operators.mssql import MsSqlOperator
+from airflow.timetables.datasets import DatasetOrTimeSchedule
+from airflow.timetables.trigger import CronTriggerTimetable
+from airflow.sensors.python import PythonSensor
+from include.extensions.operators.custom_mssqloperator import MsSqlOperatorXcom
+from include.extensions.operators.custom_databricks_operators import DatabricksSubmitRunAuditLogOperatorAsync
+from include import notification_functions
+from airflow.models import DagRun
+from airflow.hooks.base import BaseHook
+from airflow.utils.email import send_email
+import pandas as pd
 
-# COMMAND ----------
 
-pip install pymongo==4.3.2
+logging.getLogger('azure.core').setLevel(logging.WARN)
 
-# COMMAND ----------
+ABC_SQL_CONN_ID = 'CIP_EDW_AUDIT_SQLDB_CONN'
+DATABRCIKS_CONN_ID = 'CIP-EDW-DATABRICKS-CONN'
 
-# MAGIC %run /Library/SnowflakeModule
+def check_dag_run_status(dag_id_to_check, state, ti):
+    dag_run = DagRun.find(
+        dag_id=dag_id_to_check,
+        state=state
+        )
+    return not len(dag_run) > 0
 
-# COMMAND ----------
+def fetch_all_as_dict(cursor):
+    columns = [column[0] for column in cursor.description]
+    temp_results =  [dict(zip(columns, row)) for row in cursor.fetchall()]
+    results = {}
+    for cnt,elem in enumerate(temp_results):
+        row_key = elem.get('TSK_NM',f'{cnt}')
+        results.update({row_key : elem }) 
+    return results
 
-azure_env='dev'
+def get_abc_job_run_details(ti):
+    data = ti.xcom_pull(task_ids='fetch_abc_metadata', key='return_value')
+    if type(data) != dict:
+        raise Exception('Invalid type found for ABC metadata')
+    if len(list(data.values())) == 0:
+        raise Exception('No metadata from ABC found for the current run')
+    data = list(data.values())[2]
+    try:
+        data['TSK_CNFGRTN'] = json.loads(data['TSK_CNFGRTN'])
+    except:
+        pass
+    return data
 
-# COMMAND ----------
+def get_abc_job_run_details_databricks(ti):
+    data = ti.xcom_pull(task_ids='fetch_abc_metadata', key='return_value')
+    if type(data) != dict:
+        raise Exception('Invalid type found for ABC metadata')
+    if len(list(data.values())) == 0:
+        raise Exception('No metadata from ABC found for the current run')
+    databricks_tasks = {}
+    for key, value in data.items():
+        if value['TSK_CNFGRTN'] is not None and "notebook_task" in value['TSK_CNFGRTN']:
+            databricks_tasks.update({key:value})
+            databricks_tasks[key]['TSK_CNFGRTN'] = json.loads(value['TSK_CNFGRTN'])
+            databricks_tasks[key]['TSK_CNFGRTN']['notebook_task']['base_parameters'].update({'JOB_RUN_ID':value['JOB_RUN_ID']})
+            databricks_tasks[key]['TSK_CNFGRTN']['notebook_task']['base_parameters'].update({'PRCSSNG_RNGE_STRT_DT_TM':value['PRCSSNG_RNGE_STRT_DT_TM']})
+    
+    return databricks_tasks
 
-if azure_env == 'dev':
-  database_name = "Leaderboard_Dev"
-
-if azure_env == 'tst':
-  database_name = "Leaderboard_Test"
-
-if azure_env == 'stg':
-  database_name = "Leaderboard_Stg"
-
-if azure_env == 'prd':
-  database_name = "Leaderboard_Prd"
-
-# COMMAND ----------
-
-# MAGIC %run /cip/WynnRewards/2.0/WynnRewardsConfig
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Libraries/setup
-
-# COMMAND ----------
-
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-from pyspark.sql.window import Window
-from pyspark.sql import DataFrame
-import pymongo
-import json
-import datetime
-
-# mongo_connection_string = dbutils.secrets.get(f'cip-{azure_env}-shared-kv-scope', 'cip-mongo-leaderboard-cs')
-mongo_connection_string = 'mongodb+srv://svc_guestjourneyops_edw_dev_user:zhyL2KOBw7qoe0uy@guestjourneyops-dev-pri.xwl4k.mongodb.net/?retryWrites=true&w=majority&appName=GuestJourneyOps-Dev'
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Function definitions
-
-# COMMAND ----------
-
-def get_mongo_client(database_uri=mongo_connection_string, database_name=database_name):
-  #Function that returns an instance of a mongodb database with Pymongo
-  client = pymongo.MongoClient(database_uri) # establishing connection to the database
-  return client
+def cipedw_operawlv_hotelguestdailyagg_load_report_to_html_email(ti, **kwargs):    
+    sql_file_path = '/usr/local/airflow/include/sql/snowflake/bkf/hotelguestdailyagg_load_status_check.sql'    
    
-def write_df_into_mongodb(df, target_collection, uri=mongo_connection_string, database=database_name, format='mongo', mode='overwrite', truncate='true'):
-  #Function that writes one pyspark dataframe into a collection in mongodb with the spark-mongodb connector
-  try:
-    (
-     df.write
-       .format(format)
-       .mode(mode)
-       .option('truncate', truncate)
-       .option("uri", uri)
-       .option("database", database)
-       .option("collection", target_collection)
-       .save()
-    ) 
-  except Exception as err:
-    raise Exception(f"Failed writing dataframe to mongo database: {database} - collection: {target_collection} with the error :- {str(err)}")  
-        
-def upsert_mongodb_collection(collection_target_name, collection_stg_name, unique_identifier_fields, mongo_connection_string=mongo_connection_string, database_name=database_name):
-  #Function that upsert two collections inside of mongodb
-  #A pipeline is set of operations that will be run inside mongodb, we use merge aggregation for the upsert (https://bit.ly/3zmKzcG)
-  client = get_mongo_client()
-  db = client[database_name]
-  
-  pipeline = [
-    {
-      "$merge": {
-         "into": {
-            "db": database_name,
-            "coll": collection_target_name
-            },
-         "on": unique_identifier_fields,
-         "whenMatched": "replace",
-         "whenNotMatched": "insert"
-      }
-    }
-  ]
-  
-  try:
-    db[collection_stg_name].aggregate(pipeline) # this line executes the pipeline into mongodb
-  except Exception as err:
-    raise Exception(f"Failed merge into: {collection_target_name} with the error :- {str(err)}")  
+    with open(sql_file_path, 'r') as file:
+        query = file.read()
     
-def merge_df_to_mongo_collection(df_target_toMongo, target_collection, target_stg_collection):
-  #Function that merges incoming dataframe to target collection in mongodb
-  client = get_mongo_client()
-  db = client[database_name]
-
-  try:
-    #### INSERT INTO MONGODB STG
-    write_df_into_mongodb(df_target_toMongo, target_stg_collection)
-    #### UPSERT STG COLLECTION INTO TARGET COLLECTION
-    upsert_mongodb_collection(target_collection, target_stg_collection, ["_id"])
-    #### DROP STG COLLECTION  
-    db.drop_collection(target_stg_collection)    
-         
-  except Exception as err:
-    #### DROP STG COLLECTION  
-    db.drop_collection(target_stg_collection)
-    raise Exception(f"Failed to merge data to mongo wynn rewards target collection: {target_collection} with the error :- {str(err)}")  
+    hook = BaseHook.get_hook('CIP_EDW_AUDIT_SQLDB_CONN')
+    conn = hook.get_conn()
+    cursor = conn.cursor()
     
-def delete_mongodb_documents(collection_target_name, df_data_to_delete, database_name=database_name):
-  #Function to remove non active machines from the mongo db collection
-  client = get_mongo_client()
-  db = client[database_name]
+    cursor.execute(query)
+    rows = cursor.fetchall()
 
-  df = df_data_to_delete.toPandas()   
-  # Convert the dataframe into dictionary 
-  dict_data_to_delete = df.to_dict(orient = 'records') 
+    if rows:
+        print("dag_cipedw_operawlv_hotelguestdailyagg_load completed before BKF SLA. Skipping email.")
+        return
 
-  try:
-    for i in range(len(dict_data_to_delete)):
-      db[collection_target_name].delete_many(dict_data_to_delete[i]) # this line remove the non activate machines from mongo collection
-  except Exception as err:
-    raise Exception(f"Failed delete many in collecction: {collection_target_name} with the error :- {str(err)}")  
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    cip_env = os.getenv("AIRFLOW__WEBSERVER__INSTANCE_NAME", default=None)
+    email_to = ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['TSK_CNFGRTN']['to']
+    email_cc = ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['TSK_CNFGRTN']['cc']
+    email_subject = 'Hotelguestdailyagg Data Refresh Delay Report - BKF Promo'
+    email_html_content = f'''
+    <p>Hi All,</p>
+    <p>Please note that Hotelguestdailyagg Data Refresh for WLV has not been completed by 7:30 AM PT today. Please inform business about possible missing BKF reservations for BKF today.</p>
+    <p>Environment: {os.getenv("AIRFLOW__WEBSERVER__INSTANCE_NAME", default="N/A")}</p>
+    <p>Thanks,<br>CIP Team</p>
+    '''
+    
+    send_email(
+        to=email_to,
+        cc=email_cc,
+        subject=email_subject,
+        html_content=email_html_content
+    )
 
-# COMMAND ----------
+    cursor.close()
+    conn.close()
 
-def upsert_reservations_to_mongo(df, database_name, collection_name, mongo_connection_string, error_collection_name=None):
-    """
-    Upserts each row from the DataFrame into MongoDB.
-    """
-    import pymongo
-    import json
 
-    client = pymongo.MongoClient(mongo_connection_string)
-    db = client[database_name]
-    collection = db[collection_name]
-    errors = []
+def bkf_reservervations_stats_report_to_html_email(ti, **kwargs):    
+    sql_file_path = '/usr/local/airflow/include/sql/snowflake/bkf/bkf_reservervations_stats.sql'
+   
+    with open(sql_file_path, 'r') as file:
+        query = file.read()
+    
+    hook = BaseHook.get_hook('CIP_EDW_SNOWFLAKE_CONN')
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    
+    cursor.execute(query)
+    rows = cursor.fetchall()
 
-    # Convert Spark DataFrame to dict records
-    data = df.toPandas().to_dict(orient='records')
+    success_count = 0
+    error_count = 0
 
-    for row in data:
-        try:
-            # Handle special_requests as list
-            special_requests = row.get('SPECIAL_REQUESTS', [])
-            if isinstance(special_requests, str):
-                try:
-                    special_requests = json.loads(special_requests)
-                    if not isinstance(special_requests, list):
-                        special_requests = []
-                except Exception:
-                    special_requests = []
+    columns = [desc[0] for desc in cursor.description]
+    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    for row in rows:
+        status = row.get('BKF_RESERVATION_CREATE_STATUS', '')
+        cnt = row.get('CNT', 0)
+        if status == 'SUCCESS':
+            success_count = cnt
+        elif status == 'ERROR':
+            error_count = cnt
+    
+    total_count = success_count + error_count
 
-            # Data type conversions as in the original code
-            def to_int(val):
-                try:
-                    return int(val)
-                except:
-                    return None
-            def to_float(val):
-                try:
-                    return float(val)
-                except:
-                    return None
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    cip_env = os.getenv("AIRFLOW__WEBSERVER__INSTANCE_NAME", default=None)
+    
+    email_subject = f'BKF Reservations Stats for {today_str}'
+    email_html_content = f'''
+    <p>Hi All,</p>
+    <p>Please find the BKF Reservations Stats for {today_str}.</p>
+    <p>Total BKF promo eligible reservations: {total_count}.</p>
+    <p>Success Count: {success_count} / {total_count}.</p>
+    <p>Error Count: {error_count} / {total_count}.</p>
+    <p>Environment: {os.getenv("AIRFLOW__WEBSERVER__INSTANCE_NAME", default="N/A")}</p>
+    <p>Thanks,<br>CIP Team</p>
+    '''
+    
+    email_to = ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['TSK_CNFGRTN']['to']
+    email_cc = ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['TSK_CNFGRTN']['cc']
 
-            # Filter: Prefer CONFIRMATION_ID if present
-            if row['CONFIRMATION_ID'] is not None:
-                filter_doc = {
-                    "player_id": row['PLAYER_ID'],
-                    "confirmation_id": row['CONFIRMATION_ID']
-                }
-            else:
-                filter_doc = {
-                    "player_id": row['PLAYER_ID'],
-                    "room.reservation_id": row['RESERVATION_ID']
-                }
-            
-            # Build the update document, with conversions
-            update_doc = {
-                "$set": {
-                    "start_date": row['START_DATE'],   # Already ISO string, can convert if needed
-                    "end_date": row['END_DATE'],
-                    "created_dtm": row['CREATED_DTM'],
-                    "last_update_dtm": row['LAST_UPDATE_DTM'],
-                    "site_id": to_int(row['SITE_ID']),
-                    "status": row['STATUS'],
-                    "last_name": row['LAST_NAME'],
-                    "first_name": row['FIRST_NAME'],
-                    "email": row['EMAIL'],
-                    "phone_number": row['PHONE_NUMBER'],
-                    "confirmation_id": row['CONFIRMATION_ID'],
-                    "room": {
-                        "reservation_id": row['RESERVATION_ID'],
-                        "source_system_code": row['SOURCE_SYSTEM_CODE'],
-                        "source_system_id": row['SOURCE_SYSTEM_ID'],
-                        "room_type": row['ROOM_TYPE'],
-                        "precheckin": row['PRECHECKIN'],
-                        "special_requests": special_requests,
-                        "occupants": to_int(row['OCCUPANTS']),
-                        "adults": to_int(row['ADULTS']),
-                        "children": to_int(row['CHILDREN']),
-                        "market_code_first_day": row['MARKET_CODE_FIRST_DAY'],
-                        "rate_code_first_day": row['RATE_CODE_FIRST_DAY'],
-                        "block_code_first_day": row['BLOCK_CODE_FIRST_DAY'],
-                        "deposit_amount": to_float(row['DEPOSIT_AMOUNT']),
-                        "deposit_due_amount": to_float(row['DEPOSIT_DUE_AMOUNT']),
-                        "guarantee_due": row['GUARANTEE_DUE'],
-                        "company_booking": row['COMPANY_BOOKING'],
-                        "routing_room": row['ROUTING_ROOM'],
-                        "share_with_parent_id": row['SHARE_WITH_PARENT_ID']
-                    }
-                }
-            }
-            # Upsert into MongoDB
-            collection.update_one(filter_doc, update_doc, upsert=True)
+    send_email(
+        to=email_to,
+        cc=email_cc,
+        subject=email_subject,
+        html_content=email_html_content
+    )
+
+    cursor.close()
+    conn.close()
+
+
+#Input dataset
+parent__dag_cipedw_operawlv_hotelguestdailyagg_load_dataset = Dataset('snowflake://dag_cipedw_operawlv_hotelguestdailyagg_load__dag_bkfbuffetreservation_load')
+
+with DAG(
+    dag_id='dag_bkfbuffetreservation_load',
+    description="This dag ingests all the reservations with eligible rate code for BKF Promo and keep track of updates in the reservation.",
+    start_date=pendulum.datetime(2023, 3, 7, tz='America/Los_Angeles'),
+    end_date=None,
+        schedule=DatasetOrTimeSchedule(
+        timetable=CronTriggerTimetable("30 7 * * *", timezone="America/Los_Angeles"),
+        datasets=[parent__dag_cipedw_operawlv_hotelguestdailyagg_load_dataset]
+    ),
+    default_args={
+        'retries':3,
+        'retry_delay':timedelta(minutes=5),
+        "on_failure_callback": notification_functions.failure_callback,
+        "on_retry_callback": notification_functions.retry_callback
+    },
+    tags=['EDW-JOB', 'CIPEDW','DINING','BKF','SEVENROOMS'],
+    render_template_as_native_obj=True,
+    is_paused_upon_creation=True,
+    max_active_runs=1,
+    max_active_tasks=4,
+    catchup=False,
+) as dag:
+
+    fetch_abc_metadata = MsSqlOperatorXcom(
+        task_id='fetch_abc_metadata',
+        mssql_conn_id=ABC_SQL_CONN_ID,
+        sql="EXECUTE [db_cipabc].[sp_get_abc_data] @JOB_NM='{{dag.dag_id}}'",
+        handler=fetch_all_as_dict
+    )
+
+
+    get_abc_curr_job_run_details = PythonOperator(
+        task_id='get_abc_curr_job_run_details',
+        python_callable=get_abc_job_run_details
+    )
+
+
+    get_abc_curr_job_run_details_databricks = PythonOperator(
+        task_id='get_abc_curr_job_run_details_databricks',
+        python_callable=get_abc_job_run_details_databricks
+    )
+
+    cipedw_operawlv_hotelguestdailyagg_load_report = PythonOperator(
+        task_id='cipedw_operawlv_hotelguestdailyagg_load_report',
+        python_callable=cipedw_operawlv_hotelguestdailyagg_load_report_to_html_email,
+        provide_context=True
+    )
+
+    check_dag_cipedw_operawlv_hotelguestdailyagg_load_sensor = PythonSensor(
+        task_id='check_dag_cipedw_operawlv_hotelguestdailyagg_load_sensor',
+        mode='reschedule',
+        poke_interval=300,
+        timeout=7200,
+        python_callable=check_dag_run_status,
+        op_kwargs={'dag_id_to_check': "dag_cipedw_operawlv_hotelguestdailyagg_load", "state" : "running"},
+        )
+
+    begin_audit_job_execution = MsSqlOperator(
+        task_id='begin_audit_job_execution',
+        mssql_conn_id=ABC_SQL_CONN_ID,
+        sql='''
+            EXECUTE [db_cipabc].[sp_log_abc_data]
+             @JOB_MSTR_ID={{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['JOB_MSTR_ID'] }}
+            ,@JOB_RUN_ID={{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['JOB_RUN_ID'] }}
+            ,@EXCTN_DT='{{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['EXCTN_DT'] }}'
+            ,@LOG_TYPE='JOB EXECUTION'
+            ,@LOG_STATUS='RUNNING'
+            ,@DML_ACTION='INSERT'
+           '''         
+           )
+
+
+    bkfbuffetreservation_data_load = DatabricksSubmitRunAuditLogOperatorAsync(
+           task_id="bkfbuffetreservation_data_load",
+           retries=3,
+           execution_timeout=timedelta(hours=2),
+           databricks_conn_id=DATABRCIKS_CONN_ID,
+           new_cluster='{{ ti.xcom_pull(task_ids="get_abc_curr_job_run_details_databricks")["bkfbuffetreservation_data_load"]["TSK_CNFGRTN"]["new_cluster"] }}',
+           notebook_task='{{ ti.xcom_pull(task_ids="get_abc_curr_job_run_details_databricks")["bkfbuffetreservation_data_load"]["TSK_CNFGRTN"]["notebook_task"] }}',
+           polling_period_seconds='{{ ti.xcom_pull(task_ids="get_abc_curr_job_run_details_databricks")["bkfbuffetreservation_data_load"]["TSK_CNFGRTN"]["polling_period_seconds"] }}',           
+           mssql_conn_id=ABC_SQL_CONN_ID,
+           should_log_to_abc=True,
+           run_name="bkfbuffetreservation_data_load",
+           )
+
+
+
+    on_ingestion_success = EmptyOperator(task_id='on_ingestion_success',trigger_rule='all_done',)       
+
+    bkf_reservervations_stats_report = PythonOperator(
+        task_id='bkf_reservervations_stats_report',
+        python_callable=bkf_reservervations_stats_report_to_html_email,
+        provide_context=True
+    )
+
+    end_audit_job_execution = MsSqlOperator(
+        task_id='end_audit_job_execution',
+        mssql_conn_id=ABC_SQL_CONN_ID,
+        trigger_rule='all_done',
+        sql='''
         
-        except Exception as e:
-            print(f"Error: {str(e)}") 
-            error_detail = {
-                "RESERVATION_ID": row.get('RESERVATION_ID', ''),
-                "ERROR_MSG": str(e),
-                "ROW": row
-            }
-            errors.append(error_detail)
-
-    # Optionally log errors
-    if error_collection_name and errors:
-        db[error_collection_name].insert_many(errors)
-
-    return {"total_processed": len(data), "errors": errors}
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Reading reservations data from snowflake
-
-# COMMAND ----------
-
-SFModule.schema = 'CIPINTEGRATIONODS'
-
-#reading game type data from snowflake
-sql_query = f"""
-SELECT DISTINCT
-CAST(CAST(MBR.MEMBERSHIP_CARD_NO AS INTEGER) AS VARCHAR) AS PLAYER_ID,
-CAST(CAST(RN.CONFIRMATION_NO AS INTEGER) AS VARCHAR) AS RESERVATION_ID,
-EXRE.EXTERNAL_REFERENCE::VARCHAR AS CONFIRMATION_ID,
-CONCAT(CAST(TO_DATE(RN.BEGIN_DATE) AS VARCHAR),'T00:00:00.000Z')  AS START_DATE,
-CONCAT(CAST(TO_DATE(RN.END_DATE) AS VARCHAR),'T00:00:00.000Z')  AS END_DATE,
-TO_CHAR(RN.INSERT_DATE, 'YYYY-MM-DDTHH:MI:SS.000Z') AS CREATED_DTM,
-TO_CHAR(RN.UPDATE_DATE, 'YYYY-MM-DDTHH:MI:SS.000Z') AS LAST_UPDATE_DTM,
-CASE WHEN RN.RESORT='WLV' THEN 1 WHEN RN.RESORT='BOS' THEN 2 ELSE 0 END AS SITE_ID,
-'HOT' AS SOURCE_SYSTEM_CODE,
-RDE.RESV_STATUS AS STATUS,
-RN.PRECHECKIN::VARCHAR AS PRECHECKIN,
-NM.LAST AS LAST_NAME,
-NM.FIRST AS FIRST_NAME,
-NMEM.PHONE_NUMBER AS EMAIL,
-NMPH.PHONE_NUMBER AS PHONE_NUMBER,
-CAST(CAST(NM.NAME_ID AS INTEGER) AS VARCHAR) AS SOURCE_SYSTEM_ID,
-RDE.ROOM_LABEL AS ROOM_TYPE,
-CAST(CAST((COALESCE(RDE.ADULTS, 0) + COALESCE(RDE.CHILDREN, 0)) AS INTEGER) AS VARCHAR) AS OCCUPANTS,
-CAST(CAST(COALESCE(RDE.ADULTS,0) AS INTEGER) AS VARCHAR) AS ADULTS,
-CAST(CAST(COALESCE(RDE.CHILDREN,0) AS INTEGER) AS VARCHAR) AS CHILDREN,
-RDE.MARKET_CODE::VARCHAR AS MARKET_CODE_FIRST_DAY,
-RDE.RATE_CODE::VARCHAR AS RATE_CODE_FIRST_DAY,
-RDE.BLOCKCODE::VARCHAR AS BLOCK_CODE_FIRST_DAY,
-CAST(ROUND(COALESCE(CA.DEPOSIT_AMOUNT,0),2) AS VARCHAR) AS DEPOSIT_AMOUNT,
-CAST(ROUND((COALESCE(CA.DEPOSIT_AMOUNT,0) - COALESCE(CP.DEPOSIT_PAID,0)), 2) AS VARCHAR) AS DEPOSIT_DUE_AMOUNT,
-RDE.GUARANTEE_CODE::VARCHAR AS GUARANTEE_DUE,
-RDE.COMPANYBOOKING::VARCHAR AS COMPANY_BOOKING,
-RDE.ROUTINGROOM::VARCHAR AS ROUTING_ROOM,
-'' AS SHARE_WITH_PARENT_ID,
-SR.SPECIAL_REQUESTS AS SPECIAL_REQUESTS,
-RN.QLK_LOAD_TIMESTAMP
-FROM 
---EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_RESV_DLT_WLV RN -- Orig view
-EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_RESV_DLT_TEST_WLV RN -- Test only 
-JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_ACTIVE_MEMBERSHIPS_WLV MBR ON RN.NAME_ID = MBR.NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_EXTERNAL_REFERENCES_WLV EXRE ON RN.RESV_NAME_ID = EXRE.RESV_NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_NAME_WLV NM ON MBR.NAME_ID = NM.NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_EMAIL_WLV NMEM ON MBR.NAME_ID = NMEM.NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_PHONE_WLV NMPH ON MBR.NAME_ID = NMPH.NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_RESV_DATA_FIELDS_WLV RDE ON RN.RESV_NAME_ID = RDE.RESV_NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_DEPOSIT_AMOUNT_WLV CA ON RN.RESV_NAME_ID = CA.RESV_NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_DEPOSIT_PAID_WLV CP ON RN.RESV_NAME_ID = CP.RESV_NAME_ID
-LEFT JOIN EDW_{env}.CIPINTEGRATIONODS.VW_CX_IB_RESERVATION_SPECIAL_REQUESTS_WLV SR ON RN.RESV_NAME_ID = SR.RESV_NAME_ID
-"""
-
-df = SFModule.get_spark_df_from_sf(sqlQuery=sql_query)
+                   EXECUTE [db_cipabc].[sp_log_abc_data]
+                   @JOB_MSTR_ID={{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['JOB_MSTR_ID'] }}
+                  ,@JOB_RUN_ID={{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['JOB_RUN_ID'] }}
+                  ,@EXCTN_DT='{{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['EXCTN_DT'] }}'
+                  ,@LOG_TYPE='JOB EXECUTION'
+                  ,@LOG_STATUS='SUCCESS'
+                  ,@DML_ACTION='UPDATE'
+           '''       
+    )
+    
+    mark_job_ready_for_nextrun = MsSqlOperator(
+        task_id='mark_job_ready_for_nextrun',
+        mssql_conn_id="CIP_EDW_AUDIT_SQLDB_CONN",
+        trigger_rule='all_success',
+        sql='''
+        
+                   EXECUTE [db_cipabc].[sp_log_abc_data]
+                   @JOB_MSTR_ID={{ ti.xcom_pull(task_ids='get_abc_curr_job_run_details', key='return_value')['JOB_MSTR_ID'] }}
+                  ,@DML_ACTION='INSERT'
+                  ,@LOG_TYPE='JOB CONTROL'
+        '''       
+        )
 
 
-# COMMAND ----------
 
-display(df)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ##Merge dataframes to mongo
-
-# COMMAND ----------
-
-try:
-  result = upsert_reservations_to_mongo(
-      df=df,
-      database_name='GuestJourneyOps_Dev',
-      collection_name='ItineraryItem',
-      mongo_connection_string=mongo_connection_string,
-      #error_collection_name="UpsertErrors"      # Optional: saves error rows in a MongoDB collection
-  )
-
-  print("Done! Processed:", result["total_processed"], "Errors:", len(result["errors"]))
-
-  
-
-except Exception as err:
-  raise Exception(f"Failed to transform dataframes with the error :- {str(err)}")    
-
-# COMMAND ----------
-
-dbutils.notebook.exit(json.dumps({'jobStatus' : 'C' }))   
+    fetch_abc_metadata >> get_abc_curr_job_run_details >> get_abc_curr_job_run_details_databricks >> cipedw_operawlv_hotelguestdailyagg_load_report >> check_dag_cipedw_operawlv_hotelguestdailyagg_load_sensor >> begin_audit_job_execution >> bkfbuffetreservation_data_load >> on_ingestion_success >> bkf_reservervations_stats_report >> end_audit_job_execution >> mark_job_ready_for_nextrun
